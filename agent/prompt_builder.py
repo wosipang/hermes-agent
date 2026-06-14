@@ -1053,11 +1053,17 @@ def _build_snapshot_entry(
     if isinstance(platforms, str):
         platforms = [platforms]
 
+    # Extract triggerWords for system prompt skill matching
+    raw_triggers = frontmatter.get("triggerWords") or frontmatter.get("trigger_words") or []
+    if isinstance(raw_triggers, str):
+        raw_triggers = [t.strip() for t in raw_triggers.split(",")]
+
     return {
         "skill_name": skill_name,
         "category": category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
+        "trigger_words": [str(t).strip() for t in raw_triggers if str(t).strip()],
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
     }
@@ -1206,7 +1212,8 @@ def build_skills_system_prompt(
             ):
                 continue
             skills_by_category.setdefault(category, []).append(
-                (frontmatter_name, entry.get("description", ""))
+                (frontmatter_name, entry.get("description", ""),
+                 ", ".join(entry.get("trigger_words", [])))
             )
         category_descriptions = {
             str(k): str(v)
@@ -1231,7 +1238,8 @@ def build_skills_system_prompt(
             ):
                 continue
             skills_by_category.setdefault(entry["category"], []).append(
-                (entry["frontmatter_name"], entry["description"])
+                (entry["frontmatter_name"], entry["description"],
+                 ", ".join(entry.get("trigger_words", [])))
             )
 
         # Read category-level DESCRIPTION.md files
@@ -1261,7 +1269,7 @@ def build_skills_system_prompt(
     # precedence: we track seen names and skip duplicates from external dirs.
     seen_skill_names: set[str] = set()
     for cat_skills in skills_by_category.values():
-        for name, _desc in cat_skills:
+        for name, *_ in cat_skills:
             seen_skill_names.add(name)
 
     for ext_dir in external_dirs:
@@ -1287,7 +1295,8 @@ def build_skills_system_prompt(
                     continue
                 seen_skill_names.add(frontmatter_name)
                 skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                    (frontmatter_name, entry["description"],
+                     ", ".join(entry.get("trigger_words", [])))
                 )
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
@@ -1336,7 +1345,7 @@ def build_skills_system_prompt(
             # Deduplicate and sort skills within each category
             seen = set()
             if category in demoted:
-                names = sorted({name for name, _ in skills_by_category[category]})
+                names = sorted({name for name, *_ in skills_by_category[category]})
                 index_lines.append(f"  {category} [names only]: {', '.join(names)}")
                 continue
             cat_desc = category_descriptions.get(category, "")
@@ -1344,12 +1353,20 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+            for name, desc, triggers in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
                 seen.add(name)
                 if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+                    # Deduplicate triggers: remove ones already in description
+                    desc_lower = desc.lower()
+                    unique_triggers = [t for t in triggers.split(", ")
+                                       if t.strip().lower() not in desc_lower
+                                       and t.strip().lower().replace(" ", "") not in desc_lower.replace(" ", "")]
+                    trigger_hint = f" [触发: {', '.join(unique_triggers)}]" if unique_triggers else ""
+                    index_lines.append(f"    - {name}: {desc}{trigger_hint}")
+                elif triggers:
+                    index_lines.append(f"    - {name} [触发: {triggers}]")
                 else:
                     index_lines.append(f"    - {name}")
 
