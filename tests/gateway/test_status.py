@@ -174,6 +174,54 @@ class TestGatewayPidState:
         assert status.get_running_pid() is None
         assert not pid_path.exists()
 
+    def test_get_running_pid_accepts_no_supervisor_restart_runtime(self, tmp_path, monkeypatch):
+        """WSL/no-systemd restart fallback runs the gateway in a restart argv process."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        pid_path = tmp_path / "gateway.pid"
+        record = {
+            "pid": os.getpid(),
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway", "restart"],
+            "start_time": 123,
+        }
+        pid_path.write_text(json.dumps(record))
+
+        monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda pid: "python -m hermes_cli.main gateway restart",
+        )
+
+        assert status.acquire_gateway_runtime_lock() is True
+        try:
+            assert status.get_running_pid() == os.getpid()
+        finally:
+            status.release_gateway_runtime_lock()
+
+    def test_get_running_pid_falls_back_to_no_supervisor_runtime_state(self, tmp_path, monkeypatch):
+        """A live gateway_state.json PID should keep status accurate without a pidfile."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "gateway_state": "running",
+            "pid": os.getpid(),
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway", "restart"],
+            "start_time": 123,
+        }))
+
+        monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda pid: "python -m hermes_cli.main gateway restart",
+        )
+
+        assert status.get_running_pid() == os.getpid()
+
     def test_get_running_pid_cleans_stale_metadata_from_dead_foreign_pid(self, tmp_path, monkeypatch):
         """Stale PID file from a *different* PID (crashed process) must still be cleaned.
 
@@ -357,6 +405,53 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["state"] == "connected"
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
+
+
+class TestGetProcessStartTime:
+    """Start-time fingerprint backing the PID-reuse guard (#43846 / #50468).
+
+    Must be stable across repeated reads of the same live process and degrade to
+    a cross-platform psutil fallback when /proc is unavailable (macOS/Windows),
+    so the guard isn't a Linux-only no-op.
+    """
+
+    def test_live_process_is_stable_int(self):
+        import subprocess
+        import time
+        p = subprocess.Popen(["sleep", "20"])
+        try:
+            a = status._get_process_start_time(p.pid)
+            time.sleep(0.2)
+            b = status._get_process_start_time(p.pid)
+            assert a is not None and isinstance(a, int)
+            assert a == b  # same process → identical fingerprint
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_dead_pid_returns_none(self):
+        assert status._get_process_start_time(999999999) is None
+
+    def test_psutil_fallback_when_no_proc(self, monkeypatch):
+        """When /proc is missing (macOS/Windows), psutil supplies a stable int."""
+        import subprocess
+        orig_read_text = Path.read_text
+
+        def no_proc(self, *args, **kwargs):
+            if str(self).startswith("/proc/"):
+                raise FileNotFoundError
+            return orig_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", no_proc)
+        p = subprocess.Popen(["sleep", "20"])
+        try:
+            a = status._get_process_start_time(p.pid)
+            b = status._get_process_start_time(p.pid)
+            assert a is not None and isinstance(a, int)
+            assert a == b  # fallback is stable across reads
+        finally:
+            p.kill()
+            p.wait()
 
 
 class TestTerminatePid:
