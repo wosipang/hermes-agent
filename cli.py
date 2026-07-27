@@ -468,9 +468,10 @@ def load_cli_config() -> Dict[str, Any]:
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
             "threshold": 0.50,    # Compress at 50% of model's context limit
+            "min_tail_user_messages": 1,  # Real user messages guaranteed in the tail (1 = existing single anchor)
         },
         "agent": {
-            "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
+            "max_turns": 500,  # Default max tool-calling iterations (shared with subagents)
             "verbose": False,
             "system_prompt": "",
             "prefill_messages_file": "",
@@ -1431,7 +1432,7 @@ def _git_repo_root() -> Optional[str]:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
         )
         if result.returncode == 0:
             return _normalize_git_bash_path(result.stdout.strip())
@@ -1478,7 +1479,7 @@ def _resolve_worktree_base(repo_root: str) -> tuple:
     def _git(args, timeout=20):
         return subprocess.run(
             ["git", *args],
-            capture_output=True, text=True, timeout=timeout, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=repo_root,
         )
 
     # 1. Current branch's upstream, if it tracks one.
@@ -1556,7 +1557,15 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
     gitignore = Path(repo_root) / ".gitignore"
     _ignore_entry = ".worktrees/"
     try:
-        existing = gitignore.read_text() if gitignore.exists() else ""
+        # utf-8-sig: git files are UTF-8 and Notepad prepends a BOM, which
+        # would glue to the first line and defeat the membership check below
+        # (duplicating the entry); the locale default also breaks non-ASCII
+        # patterns on Windows. The append below already writes UTF-8.
+        existing = (
+            gitignore.read_text(encoding="utf-8-sig", errors="replace")
+            if gitignore.exists()
+            else ""
+        )
         if _ignore_entry not in existing.splitlines():
             with open(gitignore, "a", encoding="utf-8") as f:
                 if existing and not existing.endswith("\n"):
@@ -1577,7 +1586,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
     try:
         result = subprocess.run(
             ["git", "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
-            capture_output=True, text=True, timeout=30, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
         )
         if result.returncode != 0:
             # If branching from the resolved remote ref failed for any reason
@@ -1591,7 +1600,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
                 base_ref, base_label = "HEAD", "HEAD (fallback — remote base failed)"
                 result = subprocess.run(
                     ["git", "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
-                    capture_output=True, text=True, timeout=30, cwd=repo_root,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
                 )
             if result.returncode != 0:
                 print(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")
@@ -1606,7 +1615,14 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
         try:
             repo_root_resolved = Path(repo_root).resolve()
             wt_path_resolved = wt_path.resolve()
-            for line in include_file.read_text().splitlines():
+            # utf-8-sig, not the locale default: on a cp1251/GBK Windows
+            # machine a UTF-8 include list either decodes to mojibake paths
+            # (entries silently not copied) or raises UnicodeDecodeError,
+            # which the enclosing handler swallows at DEBUG — no include is
+            # copied at all. A Notepad BOM likewise glued to the first entry.
+            for line in include_file.read_text(
+                encoding="utf-8-sig", errors="replace"
+            ).splitlines():
                 entry = line.strip()
                 if not entry or entry.startswith("#"):
                     continue
@@ -1672,7 +1688,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
     try:
         subprocess.run(
             ["git", "worktree", "lock", "--reason", f"hermes pid={os.getpid()}", str(wt_path)],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
         logger.debug("Worktree locked: %s (pid=%s)", wt_path, os.getpid())
     except Exception as e:
@@ -1705,7 +1721,7 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
     try:
         remote_refs = subprocess.run(
             ["git", "for-each-ref", "--format=%(refname)", "refs/remotes"],
-            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
         )
         if remote_refs.returncode != 0:
             return True
@@ -1714,7 +1730,7 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
 
         result = subprocess.run(
             ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
-            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
         )
         if result.returncode != 0:
             return True
@@ -1735,13 +1751,163 @@ def _worktree_is_dirty(worktree_path: str, timeout: int = 10) -> bool:
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
-            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
         )
         if result.returncode != 0:
             return True
         return bool(result.stdout.strip())
     except Exception:
         return True
+
+
+# Upper bound on retained `git cherry` verdict entries (see
+# _save_worktree_merge_cache). Each entry is ~90 bytes, so this caps the cache
+# near 90 KB even on a repo that churns thousands of worktree branches.
+_WORKTREE_MERGE_CACHE_MAX = 1000
+
+
+def _worktree_merge_cache_path() -> Path:
+    """Path of the patch-equivalence verdict cache (profile-aware)."""
+    return get_hermes_home() / "cache" / "worktree_merge_verdicts.json"
+
+
+def _load_worktree_merge_cache() -> Dict[str, bool]:
+    """Load the ``git cherry`` verdict cache. Missing/corrupt cache = empty."""
+    try:
+        raw = json.loads(
+            _worktree_merge_cache_path().read_text(encoding="utf-8")
+        )
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    entries = raw.get("verdicts")
+    if not isinstance(entries, dict):
+        return {}
+    # Only keep well-formed bool verdicts — a hand-edited or partially written
+    # cache must never inject a non-bool into the prune decision.
+    return {k: v for k, v in entries.items() if isinstance(v, bool)}
+
+
+def _save_worktree_merge_cache(verdicts: Dict[str, bool]) -> None:
+    """Persist the verdict cache atomically. Best-effort — never raises.
+
+    Bounded to the most recent ``_WORKTREE_MERGE_CACHE_MAX`` entries so the
+    file can't grow without limit across thousands of sessions.
+    """
+    path = _worktree_merge_cache_path()
+    tmp = None
+    try:
+        items = list(verdicts.items())
+        if len(items) > _WORKTREE_MERGE_CACHE_MAX:
+            items = items[-_WORKTREE_MERGE_CACHE_MAX:]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(
+            json.dumps({"version": 1, "verdicts": dict(items)}),
+            encoding="utf-8",
+        )
+        os.replace(str(tmp), str(path))
+    except Exception as e:
+        logger.debug("Could not persist worktree merge cache: %s", e)
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+
+
+def _worktree_commits_all_merged_upstream(
+    worktree_path: str,
+    timeout: int = 30,
+    max_ahead: int = 20,
+    cache: Optional[Dict[str, bool]] = None,
+) -> bool:
+    """Return whether every local-only commit is patch-equivalent to a commit
+    already on the default upstream branch.
+
+    The dominant ``.worktrees/`` leak: a branch is pushed, its PR is
+    squash-merged (or cherry-picked), and the remote branch is deleted. The
+    local commits are then unreachable from ``refs/remotes/*`` forever, so the
+    unpushed-commits guard preserves the worktree indefinitely even though its
+    content is fully merged. ``git cherry`` detects patch-equivalence, letting
+    the pruner reap these.
+
+    Bounded: skips (returns False) when the branch is more than ``max_ahead``
+    commits ahead — a stale-base tree, too expensive to diff-hash and unlikely
+    to be a merged scratch branch. Fails SAFE toward False (preserve).
+
+    ``git cherry`` diff-hashes every commit in the range, which on a large repo
+    costs ~0.2-1.0s per worktree — and a tree preserved for unpushed work is
+    re-tested on *every* startup, forever, always reaching the same answer. When
+    *cache* is provided, the verdict is memoized against
+    ``(base_sha, head_sha, max_ahead)``: the exact inputs ``git cherry``
+    consumes. A cache hit is therefore identical to recomputation by
+    construction — if either ref moves the key changes and the real git call
+    runs again.
+    """
+    import subprocess
+
+    base = None
+    for candidate in ("origin/HEAD", "origin/main", "origin/master"):
+        try:
+            probe = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", candidate],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
+            )
+            if probe.returncode == 0 and probe.stdout.strip():
+                base = candidate
+                break
+        except Exception:
+            return False
+    if base is None:
+        return False
+
+    try:
+        # Resolve both endpoints to shas up front. These are the complete
+        # inputs to the range below, so they form an exact cache key. Cheap
+        # (~1ms) relative to the diff-hashing `git cherry` they guard.
+        cache_key = None
+        if cache is not None:
+            revs = subprocess.run(
+                ["git", "rev-parse", f"{base}^{{commit}}", "HEAD^{commit}"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
+            )
+            if revs.returncode == 0:
+                shas = revs.stdout.split()
+                if len(shas) == 2:
+                    cache_key = f"{shas[0]}..{shas[1]}:{max_ahead}"
+                    if cache_key in cache:
+                        return cache[cache_key]
+
+        def _memo(verdict: bool) -> bool:
+            if cache is not None and cache_key is not None:
+                cache[cache_key] = verdict
+            return verdict
+
+        ahead = subprocess.run(
+            ["git", "rev-list", "--count", f"{base}..HEAD"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
+        )
+        if ahead.returncode != 0:
+            return False
+        count = int(ahead.stdout.strip() or "0")
+        if count == 0:
+            return _memo(True)
+        if count > max_ahead:
+            return _memo(False)
+
+        cherry = subprocess.run(
+            ["git", "cherry", base, "HEAD"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
+        )
+        if cherry.returncode != 0:
+            return False
+        lines = [ln for ln in cherry.stdout.splitlines() if ln.strip()]
+        # "-" = patch-equivalent commit exists upstream; "+" = unique local work
+        return _memo(bool(lines) and all(ln.startswith("-") for ln in lines))
+    except Exception:
+        return False
 
 
 def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10):
@@ -1768,7 +1934,7 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
     try:
         result = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, timeout=timeout, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=repo_root,
         )
         if result.returncode != 0:
             return "live"
@@ -1843,7 +2009,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     try:
         subprocess.run(
             ["git", "worktree", "unlock", wt_path],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
     except Exception as e:
         logger.debug("git worktree unlock failed (non-fatal): %s", e)
@@ -1851,7 +2017,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     try:
         subprocess.run(
             ["git", "worktree", "remove", wt_path, "--force"],
-            capture_output=True, text=True, timeout=15, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, cwd=repo_root,
         )
     except Exception as e:
         logger.debug("Failed to remove worktree: %s", e)
@@ -1860,7 +2026,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     try:
         subprocess.run(
             ["git", "branch", "-D", branch],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
     except Exception as e:
         logger.debug("Failed to delete branch %s: %s", branch, e)
@@ -1911,6 +2077,16 @@ def _run_state_db_auto_maintenance(session_db) -> None:
             logger.debug("Orphan compression finalize skipped: %s", _finalize_exc)
 
         cfg = (_load_full_config().get("sessions") or {})
+
+        # Auto-archive (soft-hide stale sessions) is independent of the
+        # destructive auto_prune sweep — run it first, before prune's early
+        # return, so enabling one doesn't require the other.
+        if cfg.get("auto_archive", False):
+            session_db.maybe_auto_archive(
+                idle_days=float(cfg.get("auto_archive_days", 3)),
+                min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+            )
+
         if not cfg.get("auto_prune", False):
             return
         session_db.maybe_auto_prune_and_vacuum(
@@ -1937,10 +2113,15 @@ def _run_checkpoint_auto_maintenance() -> None:
         if not cfg.get("auto_prune", False):
             return
         from tools.checkpoint_manager import maybe_auto_prune_checkpoints
+        # delete_orphans is intentionally never honoured here: a missing
+        # workdir at startup is ambiguous (deleted project vs. an unmounted
+        # external volume / network share / VPN not yet up) and this sweep
+        # runs unattended. Orphan cleanup is only ever done via the explicit
+        # `hermes checkpoints prune` command, which the user has to invoke.
         maybe_auto_prune_checkpoints(
             retention_days=int(cfg.get("retention_days", 7)),
             min_interval_hours=int(cfg.get("min_interval_hours", 24)),
-            delete_orphans=bool(cfg.get("delete_orphans", True)),
+            delete_orphans=False,
             max_total_size_mb=int(cfg.get("max_total_size_mb", 500)),
         )
     except Exception as exc:
@@ -1950,11 +2131,21 @@ def _run_checkpoint_auto_maintenance() -> None:
 def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     """Remove stale worktrees and orphaned branches on startup.
 
-    Age-based tiers (aggressive cleanup keeps ``.worktrees/`` from growing
-    unbounded):
-    - Under max_age_hours (24h): skip — session may still be active.
-    - 24h–72h: remove if no unpushed commits.
-    - Over 72h: force remove regardless (nothing should sit this long).
+    Covers EVERY directory under ``.worktrees/`` except kanban task trees
+    (``t_<hex>`` — owned by the kanban dispatcher's own gc). Scratch trees
+    created by ``hermes -w`` (``hermes-*``) age out fast; named trees created
+    manually for salvage/review lanes age out on a slower schedule:
+
+    - ``hermes-*``: skip under 24h; reap 24h+ when clean and merged/pushed;
+      72h+ is the aggressive tier (still never deletes real work).
+    - named trees: same logic at 3x the timeline (72h soft / 9d hard).
+
+    Work-preservation guards (all tiers, any age):
+    - uncommitted changes (dirty) — never removed;
+    - unpushed commits — never removed, UNLESS every local-only commit is
+      patch-equivalent to a commit already on upstream (``git cherry``): the
+      squash-merged-PR case, which is the dominant ``.worktrees/`` leak since
+      those commits stay unreachable from ``refs/remotes/*`` forever.
 
     Lock handling (orthogonal to age): ``hermes -w`` locks each worktree with
     reason ``hermes pid=<pid>`` so a concurrent hermes process leaves an in-use
@@ -1967,9 +2158,29 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     removal never orphans the branch (which would drop easy reachability of any
     commits still in the worktree).
 
+    Preserved-work visibility: trees skipped for unpushed/dirty reasons that
+    are older than 7 days are listed in a single WARNING so real in-flight
+    work can't rot silently.
+
     Also prunes orphaned ``hermes/*`` and ``pr-*`` local branches that
     have no corresponding worktree.
+
+    Performance: this runs on the startup path of every ``hermes -w`` session,
+    and each candidate tree costs several git subprocesses (the ``git cherry``
+    patch-equivalence probe dominates at ~0.2-1.0s on a large repo). With
+    dozens of accumulated worktrees the serial version added ~11-18s of latency
+    before the banner. Two changes keep the decisions byte-identical while
+    removing nearly all of that:
+
+    1. The read-only classification of each tree (dirty / unpushed / merged /
+       lock state) is independent per tree, so it runs on a thread pool. Only
+       the mutating phase (unlock, remove, branch -D) stays serial and ordered.
+    2. ``git cherry`` verdicts are memoized on disk keyed by the exact
+       ``(base_sha, head_sha)`` range they were computed from, so a tree
+       preserved for unpushed work is not re-diff-hashed on every subsequent
+       startup.
     """
+    import re
     import subprocess
     import time
 
@@ -1979,14 +2190,27 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
         return
 
     now = time.time()
-    soft_cutoff = now - (max_age_hours * 3600)       # 24h default
-    hard_cutoff = now - (max_age_hours * 3 * 3600)   # 72h default
+    stale_work_cutoff = now - (7 * 24 * 3600)
+    preserved_stale: list = []
+    # Kanban task worktrees (<repo>/.worktrees/t_<hex>) have their own
+    # dispatcher-driven lifecycle (hermes kanban gc) — never touch them here.
+    kanban_re = re.compile(r"^t_[0-9a-f]+$")
 
-    for entry in worktrees_dir.iterdir():
-        if not entry.is_dir() or not entry.name.startswith("hermes-"):
+    # ── Phase 1: age filter (no subprocesses) ───────────────────────────────
+    # Cheap stat-only pass so the thread pool below is sized to the trees that
+    # actually need git work, not to everything on disk.
+    candidates: list = []
+    for entry in sorted(worktrees_dir.iterdir()):
+        if not entry.is_dir() or kanban_re.match(entry.name):
             continue
 
-        # Check age
+        # Scratch trees (hermes-*) age out on the default schedule; named
+        # trees (salvage/review lanes someone created deliberately) get 3x.
+        scratch = entry.name.startswith("hermes-")
+        tier_hours = max_age_hours if scratch else max_age_hours * 3
+        soft_cutoff = now - (tier_hours * 3600)
+        hard_cutoff = now - (tier_hours * 3 * 3600)
+
         try:
             mtime = entry.stat().st_mtime
             if mtime > soft_cutoff:
@@ -1994,19 +2218,42 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
         except Exception:
             continue
 
-        force = mtime <= hard_cutoff  # Over 72h — reap aggressively
+        candidates.append((entry, mtime, mtime <= hard_cutoff))
 
-        # Never delete real work, regardless of age. Unpushed commits and
-        # uncommitted changes may be a crashed session's in-flight work; the
-        # >72h tier reaps only abandoned *clean, fully-pushed* worktrees (the
-        # scratch trees that actually cause .worktrees/ bloat).
+    if not candidates:
+        _prune_orphaned_branches(repo_root)
+        return
+
+    # ── Phase 2: classify in parallel (read-only git queries) ───────────────
+    # Every check here is a read-only git query against a distinct worktree, so
+    # they are safe to run concurrently (git takes no repo-wide lock for these,
+    # and each has its own index). Verdicts are collected and applied serially
+    # below so removal order and log output stay deterministic.
+    merge_cache = _load_worktree_merge_cache()
+    cache_size_before = len(merge_cache)
+    cache_lock = threading.Lock()
+
+    def _classify(item):
+        entry, mtime, force = item
+        # Never delete real work, regardless of age or tier. Uncommitted
+        # changes and unpushed commits may be a crashed session's in-flight
+        # work; only clean, fully-merged/pushed trees (the scratch trees that
+        # actually cause .worktrees/ bloat) are ever reaped.
+        if _worktree_is_dirty(str(entry), timeout=5):
+            return (entry, mtime, force, "dirty", None)
         if _worktree_has_unpushed_commits(str(entry), timeout=5):
-            continue  # Has unpushed commits or can't check — skip
-        if not force:
-            # 24h–72h tier is conservative: unpushed check above is enough.
-            pass
-        elif _worktree_is_dirty(str(entry), timeout=5):
-            continue  # >72h but dirty — preserve uncommitted work
+            # Squash-merge escape hatch: commits unreachable from any remote
+            # ref but patch-equivalent to upstream commits are merged work,
+            # not unpushed work.
+            with cache_lock:
+                snapshot = dict(merge_cache)
+            merged = _worktree_commits_all_merged_upstream(
+                str(entry), timeout=30, cache=snapshot
+            )
+            with cache_lock:
+                merge_cache.update(snapshot)
+            if not merged:
+                return (entry, mtime, force, "unpushed", None)
 
         # Respect git-native session locks. A lock owned by a still-running
         # hermes process means the worktree is actively in use — never touch
@@ -2015,13 +2262,47 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
         # otherwise dead-locked worktrees pile up indefinitely.
         lock_state = _worktree_lock_is_live(repo_root, str(entry), timeout=5)
         if lock_state == "live":
+            return (entry, mtime, force, "locked-live", None)
+        return (entry, mtime, force, "reap", lock_state)
+
+    # Bounded pool: enough to hide git's per-process startup latency without
+    # spawning dozens of concurrent git processes on a small machine.
+    workers = max(1, min(8, (os.cpu_count() or 4), len(candidates)))
+    try:
+        if workers > 1:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="hermes-wt-prune"
+            ) as pool:
+                verdicts = list(pool.map(_classify, candidates))
+        else:
+            verdicts = [_classify(c) for c in candidates]
+    except Exception as e:
+        # Never let a pool failure block startup — fall back to serial.
+        logger.debug("Parallel worktree classification failed (%s); serial", e)
+        verdicts = [_classify(c) for c in candidates]
+
+    if len(merge_cache) != cache_size_before:
+        _save_worktree_merge_cache(merge_cache)
+
+    # ── Phase 3: mutate serially (unlock / remove / branch -D) ──────────────
+    for entry, mtime, force, verdict, lock_state in verdicts:
+        if verdict == "dirty":
+            if mtime <= stale_work_cutoff:
+                preserved_stale.append(f"{entry.name} (uncommitted changes)")
+            continue
+        if verdict == "unpushed":
+            if mtime <= stale_work_cutoff:
+                preserved_stale.append(f"{entry.name} (unpushed commits)")
+            continue
+        if verdict == "locked-live":
             logger.debug("Skipping live-locked worktree: %s", entry.name)
             continue
+
         if lock_state == "dead":
             try:
                 subprocess.run(
                     ["git", "worktree", "unlock", str(entry)],
-                    capture_output=True, text=True, timeout=10, cwd=repo_root,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
                 )
             except Exception as e:
                 logger.debug("Failed to unlock dead worktree %s: %s", entry.name, e)
@@ -2030,13 +2311,13 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
         try:
             branch_result = subprocess.run(
                 ["git", "branch", "--show-current"],
-                capture_output=True, text=True, timeout=5, cwd=str(entry),
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, cwd=str(entry),
             )
             branch = branch_result.stdout.strip()
 
             remove_result = subprocess.run(
                 ["git", "worktree", "remove", str(entry), "--force"],
-                capture_output=True, text=True, timeout=15, cwd=repo_root,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, cwd=repo_root,
             )
             if remove_result.returncode != 0:
                 # Removal failed — keep the branch so any commits stay
@@ -2049,11 +2330,18 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
             if branch:
                 subprocess.run(
                     ["git", "branch", "-D", branch],
-                    capture_output=True, text=True, timeout=10, cwd=repo_root,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
                 )
             logger.debug("Pruned stale worktree: %s (force=%s)", entry.name, force)
         except Exception as e:
             logger.debug("Failed to prune worktree %s: %s", entry.name, e)
+
+    if preserved_stale:
+        logger.warning(
+            "Preserving %d worktree(s) older than 7 days with unmerged work "
+            "(push or remove them to reclaim disk): %s",
+            len(preserved_stale), ", ".join(sorted(preserved_stale)),
+        )
 
     _prune_orphaned_branches(repo_root)
 
@@ -2070,7 +2358,7 @@ def _prune_orphaned_branches(repo_root: str) -> None:
     try:
         result = subprocess.run(
             ["git", "branch", "--format=%(refname:short)"],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
         if result.returncode != 0:
             return
@@ -2083,7 +2371,7 @@ def _prune_orphaned_branches(repo_root: str) -> None:
     try:
         wt_result = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
         for line in wt_result.stdout.split("\n"):
             if line.startswith("branch refs/heads/"):
@@ -2095,7 +2383,7 @@ def _prune_orphaned_branches(repo_root: str) -> None:
     try:
         head_result = subprocess.run(
             ["git", "branch", "--show-current"],
-            capture_output=True, text=True, timeout=5, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, cwd=repo_root,
         )
         current = head_result.stdout.strip()
         if current:
@@ -2119,7 +2407,7 @@ def _prune_orphaned_branches(repo_root: str) -> None:
         try:
             subprocess.run(
                 ["git", "branch", "-D"] + batch,
-                capture_output=True, text=True, timeout=30, cwd=repo_root,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
             )
         except Exception as e:
             logger.debug("Failed to prune orphaned branches: %s", e)
@@ -3757,6 +4045,28 @@ def save_config_value(key_path: str, value: any) -> bool:
 # HermesCLI Class
 # ============================================================================
 
+
+def _normalize_moa_model(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Map a ``moa:<preset>`` model string to ``(provider, preset)``.
+
+    Returns ``("moa", "<preset>")`` when *model* selects the MoA virtual
+    provider, otherwise ``(None, model)`` unchanged. This gives non-interactive
+    ``hermes chat -Q -m moa:<preset>`` the same routing the interactive
+    ``/moa`` command and the model picker already use: ``resolve_runtime_provider``
+    handles ``requested_provider == "moa"`` and ``agent_init`` builds the
+    MoAClient off ``provider == "moa"``. Without this the raw ``moa:<preset>``
+    string is sent to the real provider and rejected with a 401/400 "model not
+    supported" (#56828).
+    """
+    if isinstance(model, str):
+        stripped = model.strip()
+        if stripped.lower().startswith("moa:"):
+            preset = stripped.split(":", 1)[1].strip()
+            if preset:
+                return "moa", preset
+    return None, model
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -3789,7 +4099,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
-            max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
+            max_turns: Maximum tool-calling iterations shared with subagents (default: 500)
             verbose: Enable verbose logging
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
@@ -3887,6 +4197,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _config_model = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
         _DEFAULT_CONFIG_MODEL = ""
         self.model = model or _config_model or _DEFAULT_CONFIG_MODEL
+        # A ``moa:<preset>`` model string selects the MoA virtual provider in
+        # one shot (parity with interactive ``/moa`` and the model picker). Do
+        # this before provider resolution so ``-Q -m moa:<preset>`` routes
+        # through MoA instead of hitting the real provider with an unknown
+        # model (#56828). A ``moa:`` prefix wins over an explicit ``--provider``.
+        _moa_provider_override, self.model = _normalize_moa_model(self.model)
         # Read max_tokens from config (env var override: HERMES_MAX_TOKENS)
         _env_mt = os.environ.get("HERMES_MAX_TOKENS")
         if _env_mt:
@@ -3922,7 +4238,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
-            provider
+            _moa_provider_override
+            or provider
             or CLI_CONFIG["model"].get("provider")
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or "auto"
@@ -3955,9 +4272,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             try:
                 self.max_turns = int(os.getenv("HERMES_MAX_ITERATIONS", ""))
             except (TypeError, ValueError):
-                self.max_turns = 90
+                self.max_turns = 500
         else:
-            self.max_turns = 90
+            self.max_turns = 500
         
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
@@ -4143,6 +4460,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
+        self._clarify_multi_base = None
         self._sudo_state = None
         self._sudo_deadline = 0
         self._modal_input_snapshot = None
@@ -4169,6 +4487,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._pending_tool_info: dict = {}  # function_name -> list of (preview, args) for stacked scrollback
         self._last_scrollback_tool: str = ""  # last tool name printed to scrollback (for "new" dedup)
         self._command_running = False
+        self._command_blocks_input = False
         self._command_status = ""
         # Petdex mascot (opt-in via display.pet). The base CLI mirrors the TUI's
         # PetPane: a half-block sprite above the prompt that reacts to agent
@@ -4803,6 +5122,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
 
+        # Standing /goal state (Ralph loop). GoalManager is cached on self and
+        # keeps its state in memory, so this is a cheap attribute read — no DB
+        # hit per repaint. Only an *active* goal earns a segment; paused/done
+        # goals stay out of the bar (matching the desktop's active-first row).
+        snapshot["goal_active"] = False
+        snapshot["goal_turns_used"] = 0
+        snapshot["goal_max_turns"] = 0
+        try:
+            goal_mgr = self._get_goal_manager()
+            if goal_mgr is not None and goal_mgr.is_active():
+                goal_state = goal_mgr.state
+                snapshot["goal_active"] = True
+                snapshot["goal_turns_used"] = int(getattr(goal_state, "turns_used", 0) or 0)
+                snapshot["goal_max_turns"] = int(getattr(goal_state, "max_turns", 0) or 0)
+        except Exception:
+            pass
+
 
         if not agent:
             return snapshot
@@ -5245,6 +5581,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         cont = " | Continuous" if self._voice_continuous else ""
         return [("class:voice-status", f" 🎤 Voice mode{tts}{cont}  —  {label} to record ")]
 
+    @staticmethod
+    def _status_bar_goal_segment(snapshot: Dict[str, Any]) -> str:
+        """Return the ``⊙ goal 3/20`` segment, or ``""`` when no goal is active.
+
+        Active-goal-only by design: paused/done goals don't occupy status-bar
+        real estate (they already print their own glyph lines in the thread).
+        """
+        if not snapshot.get("goal_active"):
+            return ""
+        used = snapshot.get("goal_turns_used") or 0
+        max_turns = snapshot.get("goal_max_turns") or 0
+        if max_turns:
+            return f"⊙ goal {used}/{max_turns}"
+        return "⊙ goal"
+
     def _build_status_bar_text(self, width: Optional[int] = None) -> str:
         """Return a compact one-line session status string for the TUI footer."""
         try:
@@ -5258,8 +5609,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_prefix = f"{battery_label} │ " if battery_label else ""
 
             yolo_active = self._is_session_yolo_active()
+            goal_segment = self._status_bar_goal_segment(snapshot)
             if width < 52:
                 text = f"{battery_prefix}⚕ {snapshot['model_short']} · {duration_label}"
+                if goal_segment:
+                    text += f" · {goal_segment}"
                 if yolo_active:
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
@@ -5279,6 +5633,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 bg_subagent_count = snapshot.get("active_background_subagents", 0)
                 if bg_subagent_count:
                     parts.append(f"⛓ {bg_subagent_count}")
+                if goal_segment:
+                    parts.append(goal_segment)
                 parts.append(duration_label)
                 if yolo_active:
                     parts.append("⚠ YOLO")
@@ -5306,6 +5662,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             bg_subagent_count = snapshot.get("active_background_subagents", 0)
             if bg_subagent_count:
                 parts.append(f"⛓ {bg_subagent_count}")
+            if goal_segment:
+                parts.append(goal_segment)
             parts.append(duration_label)
             prompt_elapsed = snapshot.get("prompt_elapsed")
             if prompt_elapsed:
@@ -5332,6 +5690,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             width = self._get_tui_terminal_width()
             duration_label = snapshot["duration"]
             yolo_active = self._is_session_yolo_active()
+            goal_segment = self._status_bar_goal_segment(snapshot)
             battery_label = snapshot.get("battery_label") or ""
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
 
@@ -5342,6 +5701,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
                 ]
+                if goal_segment:
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-strong", goal_segment))
                 if yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -5372,6 +5734,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if bg_subagent_count:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
+                    if goal_segment:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-strong", goal_segment))
                     frags.extend([
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
@@ -5415,6 +5780,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if bg_subagent_count:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
+                    if goal_segment:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-strong", goal_segment))
                     frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
@@ -6182,9 +6550,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return _COMMAND_SPINNER_FRAMES[frame_idx]
 
     @contextmanager
-    def _busy_command(self, status: str):
-        """Expose a temporary busy state in the TUI while a slash command runs."""
+    def _busy_command(self, status: str, *, blocks_input: bool = True):
+        """Expose a temporary busy state in the TUI while a slash command runs.
+
+        Most synchronous slash commands must reserve the composer because their
+        completion changes the active session state. Manual compression is safe
+        to draft through: the queued input is processed against the compacted
+        history after the command completes.
+        """
+        previous_blocks_input = getattr(self, "_command_blocks_input", False)
         self._command_running = True
+        self._command_blocks_input = blocks_input
         self._command_status = status
         self._invalidate(min_interval=0.0)
         try:
@@ -6192,6 +6568,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             yield
         finally:
             self._command_running = False
+            self._command_blocks_input = previous_blocks_input
             self._command_status = ""
             self._invalidate(min_interval=0.0)
 
@@ -6886,7 +7263,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     
     def show_tools(self):
         """Display available tools with kawaii ASCII art."""
-        tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+        # Pre-assembly list: /tools is a discovery/inspection surface, so it
+        # must show the full catalog including tools deferred behind the
+        # tool_search bridge (users check this to verify an MCP installed).
+        tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True,
+                                     skip_tool_search_assembly=True)
         
         if not tools:
             print("(;_;) No tools available")
@@ -9131,12 +9512,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._handle_skills_command(cmd_original)
         elif canonical == "learn":
             self._handle_learn_command(cmd_original)
+        elif canonical == "init":
+            self._handle_init_command(cmd_original)
         elif canonical == "memory":
             self._handle_memory_command(cmd_original)
         elif canonical == "platforms":
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
+        elif canonical == "egress":
+            from hermes_cli.proxy_cli import format_status_text
+
+            self._console_print(format_status_text(), highlight=False, markup=False)
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"
@@ -9374,9 +9761,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
                             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                            from hermes_cli._subprocess_compat import windows_hide_flags
                             result = subprocess.run(
                                 exec_cmd, shell=True, capture_output=True,
-                                text=True, timeout=30, env=sanitized_env
+                                text=True, encoding="utf-8", errors="replace", timeout=30, env=sanitized_env,
+                                # No console flash on Windows (#56747).
+                                creationflags=windows_hide_flags(),
                             )
                             output = result.stdout.strip() or result.stderr.strip()
                             if output:
@@ -10010,7 +10400,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
 
         original_count = len(self.conversation_history)
-        with self._busy_command("Compressing context..."):
+        with self._busy_command("Compressing context...", blocks_input=False):
             try:
                 from agent.model_metadata import estimate_request_tokens_rough
                 from agent.manual_compression_feedback import summarize_manual_compression
@@ -10066,6 +10456,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     force=True,
                     defer_context_engine_notification=True,
                 )
+
+                # If _compress_context returned unchanged because a
+                # concurrent compression lock is held, tell the user
+                # clearly instead of showing the misleading
+                # "No changes from compression" no-op text. The wording
+                # distinguishes a confirmed holder from an unconfirmed
+                # acquisition failure (describe_compression_lock_skip).
+                # Type-pinned check (is True / str): the flag's only real
+                # values are None/True/holder-string, and a bare getattr
+                # truthiness test is fooled by MagicMock auto-attributes on
+                # test-double agents (skill pitfall: MagicMock vs hasattr).
+                _lock_skip_signal = getattr(
+                    self.agent, "_compression_skipped_due_to_lock", None
+                )
+                if _lock_skip_signal is True or isinstance(_lock_skip_signal, str):
+                    from agent.manual_compression_feedback import (
+                        describe_compression_lock_skip,
+                    )
+                    print(
+                        "  "
+                        + describe_compression_lock_skip(
+                            self.agent._compression_skipped_due_to_lock
+                        )
+                    )
+                    self.agent._compression_skipped_due_to_lock = None
+                    # No boundary was committed on a lock-skip; discard the
+                    # deferred context-engine notification (exactly-once).
+                    finalize_context_engine_compression_notification(
+                        self.agent,
+                        committed=False,
+                    )
+                    return
+
                 if partial and tail:
                     compressed = rejoin_compressed_head_and_tail(compressed, tail)
                 self.conversation_history = compressed
@@ -11522,7 +11945,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             outcome = outcome[:119] + "…"
         _cprint(f"\n{_DIM}{icon} {label}: {detail} → {outcome}{_RST}")
 
-    def _clarify_callback(self, question, choices):
+    def _clarify_callback(self, question, choices, multi_select=False):
         """
         Platform callback for the clarify tool. Called from the agent thread.
 
@@ -11530,6 +11953,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         questions), then blocks until the user responds via the prompt_toolkit
         key bindings.  If no response arrives within the configured timeout the
         question is dismissed and the agent is told to decide on its own.
+
+        When ``multi_select`` is True, shows checkboxes and the user can
+        select multiple options with Space, confirming with Enter.
         """
         import time as _time
 
@@ -11540,16 +11966,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         timeout = resolve_clarify_timeout(CLI_CONFIG)
         response_queue = queue.Queue()
         is_open_ended = not choices
+        # multi-select support: only active when multi_select is True and choices exist
+        effective_multi = multi_select and not is_open_ended
 
         self._clarify_state = {
             "question": question,
             "choices": choices if not is_open_ended else [],
             "selected": 0,
+            # multi-select support
+            "multi_select": effective_multi,
+            "selected_indices": set() if effective_multi else None,
             "response_queue": response_queue,
         }
         self._clarify_deadline = None if timeout <= 0 else _time.monotonic() + timeout
         # Open-ended questions skip straight to freetext input
         self._clarify_freetext = is_open_ended
+        self._clarify_multi_base = None
 
         # Trigger an immediate prompt_toolkit repaint from this (non-main)
         # thread. Modal prompts must paint at once and must not be gated by the
@@ -11582,6 +12014,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = None
+        self._clarify_multi_base = None
         self._paint_now()
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
         return (
@@ -12004,6 +12437,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pass
             self._clarify_state = None
             self._clarify_freetext = False
+            self._clarify_multi_base = None
         if self._sudo_state:
             try:
                 self._sudo_state["response_queue"].put("")
@@ -12106,6 +12540,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     (self.provider or "").strip(),
                     (self.model or "").strip(),
                     load_config(),
+                    requested_provider=(self.requested_provider or "").strip(),
                 )
             except Exception as _img_exc:
                 logging.debug("image_routing decision failed, defaulting to text: %s", _img_exc)
@@ -12756,8 +13191,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Notify when iteration budget was hit
             if result and not result.get("completed") and not result.get("interrupted"):
                 _api_calls = result.get("api_calls", 0)
-                if _api_calls >= getattr(self.agent, "max_iterations", 90):
-                    _max_iter = getattr(self.agent, "max_iterations", 90)
+                if _api_calls >= getattr(self.agent, "max_iterations", 500):
+                    _max_iter = getattr(self.agent, "max_iterations", 500)
                     _cprint(
                         f"\n{_DIM}⚠ Iteration budget reached "
                         f"({_api_calls}/{_max_iter}) — "
@@ -13435,6 +13870,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Slash command loading state
         self._command_running = False
+        self._command_blocks_input = False
         self._command_status = ""
 
         # Secure secret capture state for skill setup
@@ -13551,6 +13987,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if self._clarify_freetext and self._clarify_state:
                 text = event.app.current_buffer.text.strip()
                 if text:
+                    # multi-select: prepend previously checked real choices
+                    base = getattr(self, '_clarify_multi_base', None)
+                    if base:
+                        text = ", ".join(base) + ", " + text
+                        self._clarify_multi_base = None
                     self._clarify_state["response_queue"].put(text)
                     self._clarify_state = None
                     self._clarify_freetext = False
@@ -13563,6 +14004,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 state = self._clarify_state
                 selected = state["selected"]
                 choices = state.get("choices") or []
+                # multi-select support: submit comma-joined list of checked choices
+                if state.get("multi_select"):
+                    indices = state.get("selected_indices")
+                    if not indices:
+                        # Nothing checked → submit empty string (parses to [])
+                        state["response_queue"].put("")
+                        self._clarify_state = None
+                        event.app.invalidate()
+                        return
+                    sorted_idx = sorted(indices)
+                    selected_choices = [choices[i] for i in sorted_idx if i < len(choices)]
+                    other_checked = len(choices) in sorted_idx
+                    if other_checked and selected_choices:
+                        # "Other" + real choices: store base choices, switch to freetext
+                        # so the user can type a custom answer that gets appended
+                        self._clarify_multi_base = selected_choices
+                        self._clarify_freetext = True
+                        event.app.invalidate()
+                        return
+                    if selected_choices:
+                        state["response_queue"].put(", ".join(selected_choices))
+                        self._clarify_state = None
+                        event.app.invalidate()
+                        return
+                    # Only "Other" was checked → switch to freetext
+                    self._clarify_freetext = True
+                    event.app.invalidate()
+                    return
+                # Original single-select behavior: submit the highlighted choice
                 if selected < len(choices):
                     state["response_queue"].put(choices[selected])
                     self._clarify_state = None
@@ -13797,11 +14267,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._clarify_state["selected"] = min(max_idx, self._clarify_state["selected"] + 1)
                 event.app.invalidate()
 
+        # multi-select support: Space toggles the checkbox at the current cursor position
+        @kb.add('space', filter=Condition(lambda: bool(self._clarify_state) and not self._clarify_freetext and self._clarify_state.get("multi_select")))
+        def clarify_toggle(event):
+            if self._clarify_state:
+                selected = self._clarify_state["selected"]
+                indices = self._clarify_state.get("selected_indices", set())
+                if selected in indices:
+                    indices.discard(selected)
+                else:
+                    indices.add(selected)
+                event.app.invalidate()
+
         # Number keys for quick clarify selection (1-9, 0 for 10th item)
         def _make_clarify_number_handler(idx):
             def handler(event):
                 if self._clarify_state and not self._clarify_freetext:
                     choices = self._clarify_state.get("choices") or []
+                    # multi-select support: number keys toggle checkboxes instead of submitting
+                    if self._clarify_state.get("multi_select"):
+                        if idx < len(choices):
+                            indices = self._clarify_state.get("selected_indices", set())
+                            if idx in indices:
+                                indices.discard(idx)
+                            else:
+                                indices.add(idx)
+                            event.app.invalidate()
+                        elif idx == len(choices):
+                            # Toggle "Other" in multi-select mode
+                            indices = self._clarify_state.get("selected_indices", set())
+                            if idx in indices:
+                                indices.discard(idx)
+                            else:
+                                indices.add(idx)
+                            event.app.invalidate()
+                        return
+                    # Original single-select: number keys submit directly
                     # Map index to choice (treating "Other" as the last option)
                     if idx < len(choices):
                         # Select a numbered choice
@@ -14396,7 +14897,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             style='class:input-area',
             multiline=True,
             wrap_lines=True,
-            read_only=Condition(lambda: bool(cli_ref._command_running)),
+            read_only=Condition(lambda: bool(cli_ref._command_blocks_input)),
             history=FileHistory(str(self._history_file)),
             # complete_while_typing fires the completer on every keystroke. The
             # completer does blocking work — fuzzy @-file indexing shells out to
@@ -14607,8 +15108,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             if cli_ref._command_running:
                 frame = cli_ref._command_spinner_frame()
+                detail = "input temporarily disabled" if cli_ref._command_blocks_input else "input stays active; Enter queues"
                 return [
-                    ('class:hint', f'  {frame} command in progress · input temporarily disabled'),
+                    ('class:hint', f'  {frame} command in progress · {detail}'),
                 ]
 
             return []
@@ -14693,6 +15195,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             question = state["question"]
             choices = state.get("choices") or []
             selected = state.get("selected", 0)
+            # multi-select support
+            multi_select = state.get("multi_select", False)
+            selected_indices = state.get("selected_indices", set()) if multi_select else set()
             preview_lines = _wrap_panel_text(question, 60)
             for i, choice in enumerate(choices):
                 # Show number prefix for quick selection (1-9 for items 1-9, 0 for 10th item)
@@ -14702,7 +15207,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     num_prefix = '0'
                 else:
                     num_prefix = ' '
-                if i == selected and not cli_ref._clarify_freetext:
+                if multi_select:
+                    cb = "[x]" if i in selected_indices else "[ ]"
+                    if i == selected and not cli_ref._clarify_freetext:
+                        prefix = f"❯ {cb} {num_prefix}. "
+                    else:
+                        prefix = f"  {cb} {num_prefix}. "
+                elif i == selected and not cli_ref._clarify_freetext:
                     prefix = f"❯ {num_prefix}. "
                 else:
                     prefix = f"  {num_prefix}. "
@@ -14715,11 +15226,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 other_num_prefix = '0'
             else:
                 other_num_prefix = ' '
-            other_label = (
-                f"❯ {other_num_prefix}. Other (type below)" if cli_ref._clarify_freetext
-                else f"❯ {other_num_prefix}. Other (type your answer)" if selected == len(choices)
-                else f"  {other_num_prefix}. Other (type your answer)"
-            )
+            other_idx_val = len(choices)
+            if multi_select:
+                cb = "[x]" if other_idx_val in selected_indices else "[ ]"
+                other_label = (
+                    f"❯ {cb} {other_num_prefix}. Other (type below)" if cli_ref._clarify_freetext
+                    else f"❯ {cb} {other_num_prefix}. Other (type your answer)" if selected == other_idx_val
+                    else f"  {cb} {other_num_prefix}. Other (type your answer)"
+                )
+            else:
+                other_label = (
+                    f"❯ {other_num_prefix}. Other (type below)" if cli_ref._clarify_freetext
+                    else f"❯ {other_num_prefix}. Other (type your answer)" if selected == len(choices)
+                    else f"  {other_num_prefix}. Other (type your answer)"
+                )
             preview_lines.extend(_wrap_panel_text(other_label, 60, subsequent_indent="    "))
             box_width = _panel_box_width("Hermes needs your input", preview_lines)
             inner_text_width = max(8, box_width - 2)
@@ -14735,7 +15255,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         num_prefix = '0'
                     else:
                         num_prefix = ' '
-                    if i == selected and not cli_ref._clarify_freetext:
+                    # multi-select support: add checkbox after cursor indicator
+                    if multi_select:
+                        cb = "[x]" if i in selected_indices else "[ ]"
+                        if i == selected and not cli_ref._clarify_freetext:
+                            prefix = f'❯ {cb} {num_prefix}. '
+                        else:
+                            prefix = f'  {cb} {num_prefix}. '
+                    elif i == selected and not cli_ref._clarify_freetext:
                         prefix = f'❯ {num_prefix}. '
                     else:
                         prefix = f'  {num_prefix}. '
@@ -14750,12 +15277,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     other_num_prefix = '0'
                 else:
                     other_num_prefix = ' '
-                if selected == other_idx and not cli_ref._clarify_freetext:
-                    other_label_mand = f'❯ {other_num_prefix}. Other (type your answer)'
-                elif cli_ref._clarify_freetext:
-                    other_label_mand = f'❯ {other_num_prefix}. Other (type below)'
+                # multi-select support: add checkbox to Other option
+                if multi_select:
+                    cb = "[x]" if other_idx in selected_indices else "[ ]"
+                    if selected == other_idx and not cli_ref._clarify_freetext:
+                        other_label_mand = f'❯ {cb} {other_num_prefix}. Other (type your answer)'
+                    elif cli_ref._clarify_freetext:
+                        other_label_mand = f'❯ {cb} {other_num_prefix}. Other (type below)'
+                    else:
+                        other_label_mand = f'  {cb} {other_num_prefix}. Other (type your answer)'
                 else:
-                    other_label_mand = f'  {other_num_prefix}. Other (type your answer)'
+                    if selected == other_idx and not cli_ref._clarify_freetext:
+                        other_label_mand = f'❯ {other_num_prefix}. Other (type your answer)'
+                    elif cli_ref._clarify_freetext:
+                        other_label_mand = f'❯ {other_num_prefix}. Other (type below)'
+                    else:
+                        other_label_mand = f'  {other_num_prefix}. Other (type your answer)'
                 other_wrapped = _wrap_panel_text(other_label_mand, inner_text_width, subsequent_indent="    ")
             elif cli_ref._clarify_freetext:
                 # Freetext-only mode: the guidance line takes the place of choices.
@@ -16278,6 +16815,9 @@ def main(
                                 (cli.provider or "").strip(),
                                 (cli.model or "").strip(),
                                 load_config(),
+                                requested_provider=(
+                                    cli.requested_provider or ""
+                                ).strip(),
                             )
                         except Exception:
                             _img_mode = "text"
