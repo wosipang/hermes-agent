@@ -4791,6 +4791,18 @@ def check_browser_vision_requirements() -> bool:
     """
     if not check_browser_requirements():
         return False
+
+    # Lightweight config probe: skip the heavy auxiliary_client import
+    # (which creates an OpenAI client, ~0.94s) when no vision path exists.
+    # Vision can resolve through: explicit auxiliary.vision.model/provider,
+    # or the auto chain (main model provider).  Check all three.
+    if not (
+        cfg_get(DEFAULT_CONFIG, "auxiliary", "vision", "model")
+        or cfg_get(DEFAULT_CONFIG, "auxiliary", "vision", "provider")
+        or cfg_get(DEFAULT_CONFIG, "model", "provider")
+    ):
+        return False
+
     try:
         from tools.vision_tools import check_vision_requirements
     except ImportError:

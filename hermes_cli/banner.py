@@ -718,10 +718,17 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     if remaining_toolsets > 0:
         right_lines.append(f"[dim {dim}](and {remaining_toolsets} more toolsets...)[/]")
 
-    # MCP Servers section (only if configured)
+    # MCP Servers section (only if configured).
+    # Cheap config probe first so non-MCP users skip the full ``mcp`` SDK
+    # import chain (~3.8s on cold start: fastmcp + jsonschema + rfc3987_syntax).
+    # get_mcp_status() itself returns [] for an empty mcp_servers config, so
+    # the lazy import below is a faithful behavior-preserving short-circuit.
+    mcp_status = []
     try:
-        from tools.mcp_tool import get_mcp_status
-        mcp_status = get_mcp_status()
+        from hermes_cli.mcp_startup import has_configured_mcp_servers
+        if has_configured_mcp_servers():
+            from tools.mcp_tool import get_mcp_status
+            mcp_status = get_mcp_status()
     except Exception:
         mcp_status = []
 

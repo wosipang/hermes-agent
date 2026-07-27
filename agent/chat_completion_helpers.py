@@ -977,6 +977,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        # Update actual model from response (e.g. LlmProxy routing auto->glm-5.2)
+        if hasattr(result["response"], "model") and result["response"].model:
+            agent._actual_model = result["response"].model
     return result["response"]
 
 
@@ -1754,6 +1757,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # model's actual context window is resolved instead of inheriting
         # the stale value from the previous model.  See #22387.
         agent._config_context_length = None
+        agent._actual_model = None  # Reset: fallback model is explicit, not routed
         agent.model = fb_model
         agent.provider = fb_provider
         agent.requested_provider = fb_provider
@@ -3041,6 +3045,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
         # Build mock response matching non-streaming shape
+        # Update agent actual model from LlmProxy routing (e.g. auto->glm-5.2)
+        if model_name:
+            agent._actual_model = model_name
         full_content = "".join(content_parts) or None
         mock_tool_calls = None
         has_truncated_tool_args = False

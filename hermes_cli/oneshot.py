@@ -146,7 +146,7 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             "reasoning_tokens": result.get("reasoning_tokens"),
             "total_tokens": result.get("total_tokens"),
             "api_calls": result.get("api_calls"),
-            "model": result.get("model"),
+            "model": result.get("actual_model") or result.get("model"),
             "provider": result.get("provider"),
             "session_id": result.get("session_id"),
             "completed": result.get("completed"),

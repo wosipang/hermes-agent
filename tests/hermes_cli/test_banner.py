@@ -5,6 +5,7 @@ from unittest.mock import patch
 from rich.console import Console
 
 import hermes_cli.banner as banner
+import hermes_cli.mcp_startup as mcp_startup
 import model_tools
 import tools.mcp_tool
 
@@ -89,7 +90,13 @@ def test_build_welcome_banner_title_is_hyperlinked_to_release():
         _patch.object(_mcp, "get_mcp_status", return_value=[]),
         _patch.object(_banner, "get_latest_release_tag", return_value=tag_url),
     ):
-        console = Console(file=buf, force_terminal=True, color_system="truecolor", width=160)
+        # legacy_windows=False forces rich 14.x Style.render() to emit
+        # OSC-8 hyperlink escapes (otherwise Windows default is True
+        # and Style.render() silently drops the link).
+        console = Console(
+            file=buf, force_terminal=True, color_system="truecolor",
+            width=160, legacy_windows=False,
+        )
         _banner.build_welcome_banner(
             console=console, model="x", cwd="/tmp",
             session_id="abc123",
@@ -122,7 +129,13 @@ def test_build_welcome_banner_title_falls_back_when_no_tag():
         _patch.object(_mcp, "get_mcp_status", return_value=[]),
         _patch.object(_banner, "get_latest_release_tag", return_value=None),
     ):
-        console = Console(file=buf, force_terminal=True, color_system="truecolor", width=160)
+        # legacy_windows=False for consistency with the hyperlink test
+        # (and so a missing tag still produces a clean "no link" assertion
+        # rather than any platform-specific Windows-legacy ANSI noise).
+        console = Console(
+            file=buf, force_terminal=True, color_system="truecolor",
+            width=160, legacy_windows=False,
+        )
         _banner.build_welcome_banner(
             console=console, model="x", cwd="/tmp",
             session_id="abc123",
@@ -141,6 +154,7 @@ def test_build_welcome_banner_disabled_mcp_shows_disabled_not_failed():
         patch.object(model_tools, "check_tool_availability", return_value=(["web"], [])),
         patch.object(banner, "get_available_skills", return_value={}),
         patch.object(banner, "get_update_result", return_value=None),
+        patch.object(mcp_startup, "has_configured_mcp_servers", return_value=True),
         patch.object(
             tools.mcp_tool,
             "get_mcp_status",
@@ -174,6 +188,7 @@ def test_build_welcome_banner_configured_mcp_is_not_failed():
         patch.object(model_tools, "check_tool_availability", return_value=(["web"], [])),
         patch.object(banner, "get_available_skills", return_value={}),
         patch.object(banner, "get_update_result", return_value=None),
+        patch.object(mcp_startup, "has_configured_mcp_servers", return_value=True),
         patch.object(
             tools.mcp_tool,
             "get_mcp_status",

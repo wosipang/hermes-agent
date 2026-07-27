@@ -572,6 +572,7 @@ def init_agent(
     _install_safe_stdio()
 
     agent.model = model
+    agent._actual_model = None  # Resolved model from response (e.g. LlmProxy routing auto->glm-5.2)
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.

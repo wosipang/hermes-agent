@@ -1815,9 +1815,13 @@ def _to_plain_data(value: Any, *, _depth: int = 0, _path: Optional[set] = None) 
         return result
     if hasattr(value, "__dict__"):
         _path.add(obj_id)
+        try:
+            attrs = vars(value)
+        except TypeError:
+            return str(value)[:1000]
         result = {
             k: _to_plain_data(v, _depth=_depth + 1, _path=_path)
-            for k, v in vars(value).items()
+            for k, v in attrs.items()
             if not k.startswith("_")
         }
         _path.discard(obj_id)

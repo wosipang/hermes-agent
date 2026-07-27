@@ -525,6 +525,7 @@ def _run_reference(
             timeout=reference_timeout,
             reasoning_config=_slot_reasoning_config(slot),
             extra_headers=extra_headers,
+            stream=True,
             **runtime,
         )
         usage = CanonicalUsage()

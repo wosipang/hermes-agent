@@ -883,8 +883,11 @@ def _termux_bundled_skills_stamp_path() -> Path:
 
 
 def _termux_bundled_skills_sync_needed() -> bool:
-    if not _is_termux_startup_environment():
-        return True
+    # The stamp gate is now applied on every platform, not just Termux.
+    # sync_skills() hashes every bundled skill (~3.1s on a 72-skill install)
+    # and is otherwise idempotent, so a cheap fingerprint invalidation key
+    # gives the same correctness guarantee at near-zero cost for the common
+    # case (no source/skill/version change since the last start).
     if os.environ.get("HERMES_TERMUX_FORCE_SKILLS_SYNC") == "1":
         return True
     try:
@@ -895,8 +898,6 @@ def _termux_bundled_skills_sync_needed() -> bool:
 
 
 def _mark_termux_bundled_skills_synced() -> None:
-    if not _is_termux_startup_environment():
-        return
     try:
         stamp = _termux_bundled_skills_stamp_path()
         stamp.parent.mkdir(parents=True, exist_ok=True)
@@ -906,13 +907,18 @@ def _mark_termux_bundled_skills_synced() -> None:
 
 
 def _sync_bundled_skills_for_startup() -> bool:
-    """Sync bundled skills, but skip unchanged Termux checkouts cheaply.
+    """Sync bundled skills, skipping when the fingerprint stamp is fresh.
 
-    Hashing every bundled skill is safe but expensive on older Android
-    storage. The git/ref stamp keeps post-update correctness: a changed
-    checkout revision forces one real sync, then later starts skip it.
+    sync_skills() hashes every bundled skill and is idempotent, but the
+    per-startup cost is ~3.1s on a 72-skill install. On Termux the slow
+    storage made that visible; on every other platform it is just dead
+    time. A fingerprint (git ref or version+date+skills/ mtime) lets us
+    skip the sync when nothing has changed since the last successful
+    start, while a stamp invalidation forces one real sync after every
+    hermes update or skill change. HERMES_TERMUX_FORCE_SKILLS_SYNC=1
+    bypasses the stamp for debugging.
     """
-    if _is_termux_startup_environment() and not _termux_bundled_skills_sync_needed():
+    if not _termux_bundled_skills_sync_needed():
         return False
 
     from tools.skills_sync import sync_skills

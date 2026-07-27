@@ -24,6 +24,14 @@ def _has_configured_mcp_servers() -> bool:
         return True
 
 
+# Public re-export of the cheap probe so non-MCP entry points (e.g. the
+# welcome banner) can short-circuit before pulling the full ``mcp`` SDK
+# import chain (~3.8s on cold start, dominated by ``mcp.server.fastmcp`` and
+# ``jsonschema``). The private alias is preserved for existing callers; this
+# is the API surface to use from new code.
+has_configured_mcp_servers = _has_configured_mcp_servers
+
+
 def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
     """Spawn one shared background MCP discovery thread for this process.
 
