@@ -262,6 +262,12 @@ export interface Translations {
     actions: Record<string, string>
   }
 
+  // Find-in-page bar (⌘F). `close` reuses common.close.
+  findInPage: {
+    next: string
+    previous: string
+  }
+
   language: {
     label: string
     description: string
@@ -449,6 +455,15 @@ export interface Translations {
       invalidJson: string
       keepAwakeTitle: string
       keepAwakeDesc: string
+    }
+    quickEntry: {
+      enabledTitle: string
+      enabledDesc: string
+      shortcutTitle: string
+      shortcutDesc: string
+      active: string
+      takenBy: string
+      invalidShortcut: string
     }
     credentials: {
       pasteKey: string
