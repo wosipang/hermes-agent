@@ -5,8 +5,61 @@ from __future__ import annotations
 import codecs
 import io
 import os
+import re
 import sys
 from pathlib import Path
+
+
+# ── Standalone env-line sanitizer (moved here to avoid importing
+#    hermes_cli.config — 245 KB / 5500+ LOC — at CLI startup ───────────────
+#
+#    Uses a regex-based heuristic ([A-Z][A-Z0-9_]{2,}=) to detect
+#    concatenated KEY=VALUE pairs.  Less precise than the config.py
+#    version (which checks against a known-keys set) but avoids the
+#    ~260 ms import cost on every CLI invocation.
+
+_ENV_KEY_RE = re.compile(r'([A-Z][A-Z0-9_]{2,}=)')
+
+
+def _sanitize_env_lines(lines: list) -> list:
+    """Fix corrupted .env lines — concatenated KEY=VALUE pairs on one line.
+
+    Uses regex heuristic instead of known-keys set to avoid importing
+    hermes_cli.config at startup.
+    """
+    sanitized: list[str] = []
+    for line in lines:
+        raw = line.rstrip("\r\n")
+        stripped = raw.strip()
+
+        if not stripped or stripped.startswith("#"):
+            sanitized.append(raw + "\n")
+            continue
+
+        # Find all KEY= needle start positions
+        match_ranges: list[tuple[int, int]] = []
+        for m in _ENV_KEY_RE.finditer(stripped):
+            match_ranges.append((m.start(), m.end()))
+
+        split_positions = sorted({
+            s for s, e in match_ranges
+            if not any(
+                s2 <= s and e2 >= e and (s2, e2) != (s, e)
+                for s2, e2 in match_ranges
+            )
+        })
+
+        if len(split_positions) > 1:
+            for i, pos in enumerate(split_positions):
+                end = split_positions[i + 1] if i + 1 < len(split_positions) else len(stripped)
+                part = stripped[pos:end].strip()
+                if part:
+                    sanitized.append(part + "\n")
+        else:
+            sanitized.append(stripped + "\n")
+
+    return sanitized
+
 
 from dotenv import load_dotenv
 from utils import atomic_replace, fast_safe_load
@@ -203,10 +256,7 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
     """
     if not path.exists():
         return
-    try:
-        from hermes_cli.config import _sanitize_env_lines
-    except ImportError:
-        return  # early bootstrap — config module not available yet
+    # Uses local _sanitize_env_lines (regex-based) to avoid importing config
 
     try:
         raw = path.read_bytes()

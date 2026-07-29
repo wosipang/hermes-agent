@@ -438,8 +438,18 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
     """
 
     def __init__(self, *args, **kwargs):
-        from hermes_cli.config import is_managed
-        self._managed = is_managed()
+        # Inline is_managed() to avoid importing hermes_cli.config (~150ms)
+        # at CLI startup.  Mirrors config.is_managed() logic: check env var
+        # then .managed marker file.
+        managed = os.getenv("HERMES_MANAGED", "").strip().lower()
+        if managed in {"true", "1", "yes"}:
+            self._managed = True
+        else:
+            try:
+                from hermes_constants import get_hermes_home
+                self._managed = (get_hermes_home() / ".managed").exists()
+            except Exception:
+                self._managed = False
         super().__init__(*args, **kwargs)
         # Snapshot the inode of the currently open stream so emit() can
         # detect external rotation without an extra fstat per write.
