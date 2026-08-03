@@ -48,10 +48,11 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, Iterator, Optional
 from urllib.parse import urljoin, urlparse
 
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -622,7 +623,9 @@ BUILTIN_TTS_PROVIDERS = frozenset({
 
 DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS = 120
 DEFAULT_COMMAND_TTS_OUTPUT_FORMAT = "mp3"
-COMMAND_TTS_OUTPUT_FORMATS = frozenset({"mp3", "wav", "ogg", "flac"})
+COMMAND_TTS_OUTPUT_FORMATS = frozenset(
+    {"mp3", "wav", "ogg", "flac", "m4a", "aac", "amr", "opus"}
+)
 DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH = 5000
 
 # Platforms whose native voice-bubble delivery requires Ogg/Opus audio.
@@ -998,10 +1001,38 @@ def _terminate_command_tts_process_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def _run_command_tts(command: str, timeout: float) -> subprocess.CompletedProcess:
-    """Run a command-provider shell command with process-tree timeout cleanup."""
-    from agent.delegation_context import delegated_child_subprocess_env
+def _command_provider_env_passthrough(config: Dict[str, Any]) -> list:
+    """Return the provider's ``env_passthrough`` allowlist (opt-out of scrub).
 
+    Command providers legitimately reference their own API keys in the shell
+    template (curl one-liners). The child env is scrubbed of Hermes secrets by
+    default; ``env_passthrough: [MY_API_KEY, ...]`` copies the named variables
+    back from the parent environment so a trusted template keeps working.
+    """
+    raw = config.get("env_passthrough")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _run_command_tts(
+    command: str,
+    timeout: float,
+    env_passthrough: Optional[list] = None,
+) -> subprocess.CompletedProcess:
+    """Run a command-provider shell command with process-tree idle cleanup.
+
+    Child env is scrubbed of Hermes secrets (salvage of #56332) while still
+    propagating delegated-child lineage markers when applicable.
+    """
+    from agent.delegation_context import delegated_child_subprocess_env
+    from tools.environments.local import hermes_subprocess_env
+
+    scrubbed = hermes_subprocess_env(inherit_credentials=False)
+    for key in env_passthrough or []:
+        value = os.environ.get(key)
+        if value is not None:
+            scrubbed[key] = value
     popen_kwargs: Dict[str, Any] = {
         "shell": True,
         "stdout": subprocess.PIPE,
@@ -1011,7 +1042,7 @@ def _run_command_tts(command: str, timeout: float) -> subprocess.CompletedProces
         # must not raise in the reader threads on non-UTF-8 Windows (#45099).
         "encoding": "utf-8",
         "errors": "replace",
-        "env": delegated_child_subprocess_env(),
+        "env": delegated_child_subprocess_env(scrubbed),
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1019,21 +1050,89 @@ def _run_command_tts(command: str, timeout: float) -> subprocess.CompletedProces
         popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(command, **popen_kwargs, stdin=subprocess.DEVNULL)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _terminate_command_tts_process_tree(proc)
+    output_queue: "queue.Queue[tuple[str, Optional[str]]]" = queue.Queue()
+    chunks: Dict[str, list[str]] = {"stdout": [], "stderr": []}
+    open_streams = {"stdout", "stderr"}
+
+    def read_stream(name: str, stream: Any) -> None:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        read1 = getattr(getattr(stream, "buffer", None), "read1", None)
         try:
-            stdout, stderr = proc.communicate(timeout=1)
-        except Exception:
-            stdout = getattr(exc, "output", None)
-            stderr = getattr(exc, "stderr", None)
-        raise subprocess.TimeoutExpired(
-            command,
-            timeout,
-            output=stdout,
-            stderr=stderr,
-        ) from exc
+            while True:
+                if read1 is None:
+                    chunk = stream.read(65536)
+                else:
+                    data = read1(65536)
+                    chunk = data.decode(encoding, errors="replace")
+                if not chunk:
+                    break
+                output_queue.put((name, chunk))
+        finally:
+            output_queue.put((name, None))
+
+    readers = [
+        threading.Thread(
+            target=read_stream,
+            args=("stdout", proc.stdout),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=read_stream,
+            args=("stderr", proc.stderr),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    while open_streams:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            name, chunk = output_queue.get(timeout=min(0.05, remaining))
+        except queue.Empty:
+            continue
+        if chunk is None:
+            open_streams.discard(name)
+            continue
+        chunks[name].append(chunk)
+        deadline = time.monotonic() + timeout
+
+    if not timed_out:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+
+    if timed_out:
+        _terminate_command_tts_process_tree(proc)
+        for reader in readers:
+            reader.join(timeout=0.5)
+        while True:
+            try:
+                name, chunk = output_queue.get_nowait()
+            except queue.Empty:
+                break
+            if chunk:
+                chunks[name].append(chunk)
+        stdout = "".join(chunks["stdout"])
+        stderr = "".join(chunks["stderr"])
+        try:
+            raise subprocess.TimeoutExpired(command, timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise subprocess.TimeoutExpired(
+                command,
+                timeout,
+                output=stdout,
+                stderr=stderr,
+            ) from exc
+
+    stdout = "".join(chunks["stdout"])
+    stderr = "".join(chunks["stderr"])
 
     if proc.returncode:
         raise subprocess.CalledProcessError(
@@ -1095,7 +1194,11 @@ def _generate_command_tts(
         command = _render_command_tts_template(command_template, placeholders)
 
         try:
-            _run_command_tts(command, timeout)
+            _run_command_tts(
+                command,
+                timeout,
+                env_passthrough=_command_provider_env_passthrough(config),
+            )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
                 f"TTS provider '{provider_name}' timed out after {timeout:g}s"
@@ -2791,6 +2894,16 @@ def text_to_speech_tool(
             file_path = _configured_command_tts_output_path(
                 file_path, command_provider_config
             )
+        from agent.file_safety import is_write_denied
+
+        if is_write_denied(str(file_path)):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"output_path targets a protected credential or system path: "
+                    f"{file_path}. Choose a normal audio output location."
+                ),
+            }, ensure_ascii=False)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         out_dir = Path(DEFAULT_OUTPUT_DIR)
@@ -3262,6 +3375,10 @@ def stream_tts_to_speaker(
 
     try:
         output_stream = None
+        streamer = None  # type: ignore[assignment]
+        _worker_thread = None
+        _audio_queue = None  # type: ignore[assignment]
+        _prefetch_threads = []
         tts_config = _load_tts_config()
 
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
@@ -3305,8 +3422,210 @@ def stream_tts_to_speaker(
         queue_timeout = 0.5
         _spoken_sentences: list[str] = []  # track spoken sentences to skip duplicates
 
+        # --- Per-sentence prefetch pipeline ---
+        # Every sentence gets its own streamer.stream() call the moment it's
+        # complete. A background prefetch thread fires the HTTP request
+        # immediately, buffering PCM chunks into a per-segment queue. The
+        # single playback worker drains these queues in FIFO order. This
+        # means sentence N+1's HTTP request fires WHILE sentence N is still
+        # playing, so by the time the worker reaches it, audio is already
+        # arriving — no inter-sentence gap.
+        _audio_queue: queue.Queue[Optional[queue.Queue[Optional[bytes]]]] = queue.Queue()
+        _prefetch_threads: list[threading.Thread] = []
+        _prefetch_sem = threading.Semaphore(3)
+        _CHUNK_QUEUE_MAX = 64
+
+        def _create_output_stream():
+            """Create and start a fresh PortAudio OutputStream."""
+            sd = _import_sounddevice()
+            new_stream = sd.OutputStream(
+                samplerate=streamer.sample_rate,
+                channels=streamer.channels,
+                dtype="int16",
+            )
+            new_stream.start()
+            return new_stream
+
+        def _consume_to_queue(
+            audio_iter: Iterator[bytes],
+            chunk_queue: "queue.Queue[Optional[bytes]]",
+        ) -> None:
+            """Consume a generator into a thread-safe queue."""
+            try:
+                for chunk in audio_iter:
+                    if stop_event.is_set():
+                        logger.info(
+                            "TTS CUT: prefetch cancelled (stop_event set "
+                            "mid-sentence) — partial audio only"
+                        )
+                        break
+                    chunk_queue.put(chunk, timeout=30.0)
+            except Exception as exc:
+                logger.warning(
+                    "TTS CUT: streaming TTS prefetch failed mid-sentence "
+                    "(partial audio only): %s",
+                    exc,
+                )
+            finally:
+                chunk_queue.put(None)  # sentinel: no more chunks
+                _prefetch_sem.release()  # free a prefetch slot
+
+        def _reinit_output_stream():
+            """Close the broken PortAudio stream and try to create a fresh one."""
+            nonlocal output_stream
+            if output_stream is not None:
+                try:
+                    output_stream.stop()
+                    output_stream.close()
+                except Exception:
+                    pass
+            try:
+                new_stream = _create_output_stream()
+                output_stream = new_stream
+                logger.info(
+                    "TTS: PortAudio output stream reinitialized after error"
+                )
+                return new_stream
+            except Exception as exc:
+                logger.warning(
+                    "TTS: PortAudio stream reinit failed: %s", exc
+                )
+                output_stream = None
+                return None
+
+        def _playback_worker() -> None:
+            """Single consumer: play audio segments from the queue in order."""
+            assert streamer is not None
+            if output_stream is not None:
+                import numpy as _np
+
+                try:
+                    from tools.voice_mode import mark_audio_output_active
+                except Exception:
+                    def mark_audio_output_active(_active):
+                        return None
+
+                mark_audio_output_active(True)
+                try:
+                    _max_reinit = 3
+                    _reinit_count = 0
+                    _current_stream = output_stream
+                    while True:
+                        chunk_queue = _audio_queue.get()
+                        if chunk_queue is None:
+                            break
+                        if stop_event.is_set():
+                            continue
+                        if _current_stream is None:
+                            _chunks = []
+                            while True:
+                                chunk = chunk_queue.get()
+                                if chunk is None:
+                                    break
+                                _chunks.append(chunk)
+                            _play_via_tempfile(
+                                iter(_chunks), stop_event, streamer.sample_rate
+                            )
+                            continue
+                        _pcm_leftover = b""
+                        while True:
+                            chunk = chunk_queue.get()
+                            if chunk is None:
+                                break
+                            if stop_event.is_set():
+                                break
+                            _buf = _pcm_leftover + chunk
+                            _aligned_len = len(_buf) - (len(_buf) % 2)
+                            if _aligned_len >= 2:
+                                try:
+                                    _current_stream.write(
+                                        _np.frombuffer(
+                                            _buf[:_aligned_len], dtype="<i2"
+                                        ).reshape(-1, 1)
+                                    )
+                                except Exception as write_exc:
+                                    logger.warning(
+                                        "PortAudio write failed, attempting "
+                                        "stream reinit: %s",
+                                        write_exc,
+                                    )
+                                    if _reinit_count < _max_reinit:
+                                        _reinit_count += 1
+                                        _current_stream = _reinit_output_stream()
+                                        if _current_stream is not None:
+                                            try:
+                                                _current_stream.write(
+                                                    _np.frombuffer(
+                                                        _buf[:_aligned_len],
+                                                        dtype="<i2",
+                                                    ).reshape(-1, 1)
+                                                )
+                                            except Exception:
+                                                pass
+                                            _pcm_leftover = (
+                                                _buf[_aligned_len:]
+                                                if _aligned_len < len(_buf)
+                                                else b""
+                                            )
+                                            continue
+                                    else:
+                                        logger.warning(
+                                            "TTS: PortAudio reinit exhausted "
+                                            "after %d attempts, falling back "
+                                            "to tempfile for remaining "
+                                            "sentences",
+                                            _max_reinit,
+                                        )
+                                        _current_stream = None
+                                    break
+                            _pcm_leftover = (
+                                _buf[_aligned_len:] if _aligned_len < len(_buf) else b""
+                            )
+                finally:
+                    mark_audio_output_active(False)
+            else:
+                while True:
+                    chunk_queue = _audio_queue.get()
+                    if chunk_queue is None:
+                        break
+                    if stop_event.is_set():
+                        continue
+                    _chunks = []
+                    while True:
+                        chunk = chunk_queue.get()
+                        if chunk is None:
+                            break
+                        _chunks.append(chunk)
+                    _play_via_tempfile(
+                        iter(_chunks), stop_event, streamer.sample_rate
+                    )
+
+        def _enqueue_audio(text_to_speak: str) -> None:
+            """Synthesize *text_to_speak* and start prefetching immediately."""
+            assert streamer is not None
+            try:
+                audio_iter = streamer.stream(text_to_speak)
+            except Exception as exc:
+                logger.warning("Streaming TTS synthesis failed: %s", exc)
+                return
+            _prefetch_sem.acquire()
+            chunk_queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=_CHUNK_QUEUE_MAX)
+            _audio_queue.put(chunk_queue)
+            t = threading.Thread(
+                target=_consume_to_queue,
+                args=(audio_iter, chunk_queue),
+                daemon=True,
+            )
+            _prefetch_threads.append(t)
+            t.start()
+
+        _worker_thread: Optional[threading.Thread] = None
+        if streamer is not None:
+            _worker_thread = threading.Thread(target=_playback_worker, daemon=True)
+            _worker_thread.start()
+
         def _speak_sentence(sentence: str):
-            """Display sentence and optionally generate + play audio."""
+            """Display sentence and route to the appropriate audio path."""
             if stop_event.is_set():
                 return
             cleaned = _strip_markdown_for_tts(sentence).strip()
@@ -3328,19 +3647,10 @@ def stream_tts_to_speaker(
             # Truncate very long sentences to the provider's per-request cap.
             if stream_max_len and len(cleaned) > stream_max_len:
                 cleaned = cleaned[:stream_max_len]
-            try:
-                audio_iter = streamer.stream(cleaned)
-                if output_stream is not None:
-                    import numpy as _np
-                    for chunk in audio_iter:
-                        if stop_event.is_set():
-                            break
-                        output_stream.write(_np.frombuffer(chunk, dtype=_np.int16).reshape(-1, 1))
-                else:
-                    # No audio device: buffer chunks to a temp WAV and play it.
-                    _play_via_tempfile(audio_iter, stop_event, streamer.sample_rate)
-            except Exception as exc:
-                logger.warning("Streaming TTS sentence failed: %s", exc)
+            # Every sentence gets its own prefetch thread — the HTTP request
+            # fires the moment the sentence boundary is detected, so audio for
+            # sentence N+1 is already buffering while sentence N plays.
+            _enqueue_audio(cleaned)
 
         def _speak_via_sync(cleaned: str):
             """Synthesize one sentence via the proven sync tool, then block on
@@ -3365,6 +3675,20 @@ def stream_tts_to_speaker(
                     except OSError:
                         pass
 
+        def _align_int16_chunks(chunks, stop_evt):
+            """Yield int16-aligned byte chunks from an iterable."""
+            leftover = b""
+            for chunk in chunks:
+                if stop_evt.is_set():
+                    break
+                buf = leftover + chunk
+                aligned_len = len(buf) - (len(buf) % 2)
+                if aligned_len >= 2:
+                    yield buf[:aligned_len]
+                leftover = buf[aligned_len:] if aligned_len < len(buf) else b""
+            if leftover:
+                yield b"\x00"
+
         def _play_via_tempfile(audio_iter, stop_evt, sample_rate=24000):
             """Write PCM chunks to a temp WAV file and play it."""
             tmp = None
@@ -3377,10 +3701,8 @@ def stream_tts_to_speaker(
                     wf.setnchannels(1)
                     wf.setsampwidth(2)  # 16-bit
                     wf.setframerate(sample_rate)
-                    for chunk in audio_iter:
-                        if stop_evt.is_set():
-                            break
-                        wf.writeframes(chunk)
+                    for aligned in _align_int16_chunks(audio_iter, stop_evt):
+                        wf.writeframes(aligned)
                 # wave.open() given a file object flushes but does NOT close it
                 # (it only closes files it opened itself, by name), so the OS
                 # handle to tmp stays open.  On Windows an open write handle
@@ -3436,6 +3758,13 @@ def stream_tts_to_speaker(
     except Exception as exc:
         logger.warning("Streaming TTS pipeline error: %s", exc)
     finally:
+        # Signal the playback worker that no more audio is coming.  This lives
+        # in finally: so an exception in the text pump still sends the sentinel.
+        if streamer is not None and _worker_thread is not None:
+            _audio_queue.put(None)
+            _worker_thread.join(timeout=300.0)
+        for t in _prefetch_threads:
+            t.join(timeout=10.0)
         # Always close the audio output stream to avoid locking the device
         if output_stream is not None:
             try:
